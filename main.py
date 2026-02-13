@@ -207,11 +207,33 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Осталось по бюджету в этом месяце: {left:.0f} {currency} (лимит {limit_amt:.0f})"
         )
 
+def migrate_personal_budgets():
+    with db() as conn, conn.cursor() as cur:
+        # add chat_id to expenses
+        cur.execute("ALTER TABLE expenses ADD COLUMN IF NOT EXISTS chat_id bigint;")
+        cur.execute("UPDATE expenses SET chat_id = tg_user_id WHERE chat_id IS NULL;")
+        cur.execute("ALTER TABLE expenses ALTER COLUMN chat_id SET NOT NULL;")
+
+        # add chat_id to budgets
+        cur.execute("ALTER TABLE budgets ADD COLUMN IF NOT EXISTS chat_id bigint;")
+        cur.execute("UPDATE budgets SET chat_id = tg_user_id WHERE chat_id IS NULL;")
+        cur.execute("ALTER TABLE budgets ALTER COLUMN chat_id SET NOT NULL;")
+
+        # unique index for personal budgets
+        cur.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS budgets_unique_personal
+            ON budgets (chat_id, tg_user_id, category, period, currency);
+        """)
+
+        conn.commit()
+
 def main():
     if not TELEGRAM_BOT_TOKEN or not OPENAI_API_KEY or not DATABASE_URL:
         raise RuntimeError("Missing env vars: TELEGRAM_BOT_TOKEN / OPENAI_API_KEY / DATABASE_URL")
 
     init_db()
+    migrate_personal_budgets()
+
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(MessageHandler(filters.ALL, on_message))
     app.run_polling()
