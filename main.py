@@ -4,7 +4,7 @@ import json
 import base64
 import logging
 from datetime import datetime, date
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 
 import httpx
 import psycopg2
@@ -24,7 +24,7 @@ PORT = int(os.getenv("PORT", "8080"))
 
 DEFAULT_CURRENCY = (os.getenv("DEFAULT_CURRENCY", "UZS") or "UZS").strip().upper()
 
-# Token saving: bot processes only when mentioned or when user replies to bot
+# Bot processes only when mentioned or user replies to bot (token saving)
 MENTION_ONLY = (os.getenv("MENTION_ONLY", "1").strip() != "0")
 
 # Optional: restrict to one topic (forum thread). 0 -> all topics
@@ -40,6 +40,10 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("budget-bot")
 
 BOT_USERNAME_CACHE: Optional[str] = os.getenv("TELEGRAM_BOT_USERNAME", "").strip() or None
+
+# Context sizes (token economy)
+HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "10"))  # last N messages (user+assistant)
+MAX_SUMMARY_CHARS = int(os.getenv("MAX_SUMMARY_CHARS", "900"))
 
 
 # =========================
@@ -57,7 +61,7 @@ def db():
 def init_db():
     """Create tables and migrate legacy schema safely (idempotent)."""
     with db() as conn, conn.cursor() as cur:
-        # expenses
+        # ---- expenses ----
         cur.execute("""
             CREATE TABLE IF NOT EXISTS expenses (
                 id SERIAL PRIMARY KEY,
@@ -87,7 +91,7 @@ def init_db():
             ON expenses (chat_id, tg_user_id, spent_at);
         """)
 
-        # budgets
+        # ---- budgets ----
         cur.execute("""
             CREATE TABLE IF NOT EXISTS budgets (
                 id SERIAL PRIMARY KEY,
@@ -108,7 +112,37 @@ def init_db():
             ON budgets (chat_id, tg_user_id, category, period, currency);
         """)
 
-        # user state for clarifications (so the bot can ask follow-up questions)
+        # ---- conversational memory (summary + last messages) ----
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS convo_memory (
+                id SERIAL PRIMARY KEY,
+                chat_id BIGINT NOT NULL,
+                tg_user_id BIGINT NOT NULL,
+                summary TEXT NOT NULL DEFAULT '',
+                updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+            );
+        """)
+        cur.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS convo_memory_unique
+            ON convo_memory (chat_id, tg_user_id);
+        """)
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS convo_messages (
+                id SERIAL PRIMARY KEY,
+                chat_id BIGINT NOT NULL,
+                tg_user_id BIGINT NOT NULL,
+                role TEXT NOT NULL,            -- 'user' | 'assistant'
+                content TEXT NOT NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT NOW()
+            );
+        """)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS convo_messages_idx
+            ON convo_messages (chat_id, tg_user_id, created_at DESC);
+        """)
+
+        # ---- pending clarification state ----
         cur.execute("""
             CREATE TABLE IF NOT EXISTS user_states (
                 id SERIAL PRIMARY KEY,
@@ -146,7 +180,6 @@ def set_budget(chat_id: int, user_id: int, category: str, period: str, limit_amo
     period = period.lower().strip()
     if period not in ("daily", "monthly"):
         raise ValueError("period must be daily or monthly")
-
     with db() as conn, conn.cursor() as cur:
         cur.execute("""
             INSERT INTO budgets (chat_id, tg_user_id, category, period, limit_amount, currency)
@@ -207,6 +240,57 @@ def list_budgets(chat_id: int, user_id: int) -> List[Dict[str, Any]]:
         """, (chat_id, user_id))
         return cur.fetchall()
 
+
+# =========================
+# Conversation memory (DB)
+# =========================
+
+def get_memory_summary(chat_id: int, user_id: int) -> str:
+    with db() as conn, conn.cursor() as cur:
+        cur.execute("SELECT summary FROM convo_memory WHERE chat_id=%s AND tg_user_id=%s;", (chat_id, user_id))
+        row = cur.fetchone()
+        return (row["summary"] if row else "") or ""
+
+
+def set_memory_summary(chat_id: int, user_id: int, summary: str):
+    summary = (summary or "")[:MAX_SUMMARY_CHARS]
+    with db() as conn, conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO convo_memory (chat_id, tg_user_id, summary, updated_at)
+            VALUES (%s, %s, %s, NOW())
+            ON CONFLICT (chat_id, tg_user_id)
+            DO UPDATE SET summary = EXCLUDED.summary, updated_at = NOW();
+        """, (chat_id, user_id, summary))
+        conn.commit()
+
+
+def add_convo_message(chat_id: int, user_id: int, role: str, content: str):
+    with db() as conn, conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO convo_messages (chat_id, tg_user_id, role, content)
+            VALUES (%s, %s, %s, %s);
+        """, (chat_id, user_id, role, content))
+        conn.commit()
+
+
+def get_recent_history(chat_id: int, user_id: int, limit: int = HISTORY_LIMIT) -> List[Dict[str, str]]:
+    with db() as conn, conn.cursor() as cur:
+        cur.execute("""
+            SELECT role, content
+            FROM convo_messages
+            WHERE chat_id=%s AND tg_user_id=%s
+            ORDER BY created_at DESC
+            LIMIT %s;
+        """, (chat_id, user_id, limit))
+        rows = cur.fetchall()
+    # reverse to chronological
+    rows = list(reversed(rows))
+    return [{"role": r["role"], "content": r["content"]} for r in rows]
+
+
+# =========================
+# Pending state (clarifications)
+# =========================
 
 def get_user_state(chat_id: int, user_id: int) -> Optional[Dict[str, Any]]:
     with db() as conn, conn.cursor() as cur:
@@ -282,109 +366,104 @@ def should_process(update: Update, bot_username: str) -> bool:
     if _extract_bot_mention(msg.text or "", msg.entities, bot_username):
         return True
 
+    # reply-to-bot
     if msg.reply_to_message and msg.reply_to_message.from_user and msg.reply_to_message.from_user.is_bot:
         if (msg.reply_to_message.from_user.username or "").lower() == bot_username.lower():
             return True
 
-    # If user is answering a clarification (stored state), allow without mention only if it is a reply to bot
     return False
 
 
 # =========================
-# OpenAI: Planner / Interpreter
+# OpenAI: conversational planner + optional followups
 # =========================
 
-PLANNER_SYSTEM = f"""
-You are an interpreter for a Telegram group personal expense tracker (per-user in a group).
-You MUST convert the user's free-form Russian text into an executable "plan" for the backend.
-Return ONLY JSON. No markdown, no extra text.
+SYSTEM_CORE = f"""
+Ты — ассистент для учёта личных расходов в Telegram-группе.
+У тебя есть доступ к базе расходов и бюджетов конкретного пользователя (по tg_user_id) внутри конкретного чата (chat_id).
 
-Important:
-- You DO NOT write SQL.
-- You MUST choose from allowed actions and parameters.
-- If information is missing, ask a clarifying question instead of guessing.
+Тебе нужно:
+- понимать свободный русский текст
+- сохранять контекст диалога (на основе краткого summary + последних сообщений)
+- формировать ПЛАН действий к базе
+- если данных не хватает — задавать ОДИН уточняющий вопрос
+- после получения данных из базы — отвечать кратко и по делу
 
-Allowed plan schemas:
+Валюта по умолчанию: {DEFAULT_CURRENCY}.
+Категории — короткие слова/фразы (1–2 слова), нижний регистр.
 
-1) Add expense:
-{{
-  "type": "expense",
-  "amount": 12345,
-  "currency": "{DEFAULT_CURRENCY}",
-  "category": "еда",
-  "note": "optional short note"
-}}
+Ты НЕ пишешь SQL. Ты выбираешь только разрешённые действия ниже.
+""".strip()
 
-2) Set budget:
-{{
-  "type": "budget",
-  "period": "daily"|"monthly",
-  "category": "еда",
-  "limit_amount": 3000000,
-  "currency": "{DEFAULT_CURRENCY}"
-}}
+PLANNER_INSTRUCTIONS = """
+Верни ТОЛЬКО JSON с одним из типов:
 
-3) Get report (totals/breakdowns):
-{{
-  "type": "report",
-  "period": "today"|"month",
-  "format": "total"|"breakdown"
-}}
+1) plan (нужно сходить в БД или записать данные):
+{
+  "type": "plan",
+  "actions": [
+    { "action": "add_expense", "amount": 12000, "currency": "UZS", "category": "такси", "note": "optional" },
+    { "action": "set_budget", "period": "daily|monthly", "category": "кофе", "limit_amount": 50000, "currency": "UZS" },
+    { "action": "get_report_total", "period": "today|month" },
+    { "action": "get_report_breakdown", "period": "today|month" },
+    { "action": "get_my_budgets" }
+  ],
+  "assistant_message": "короткий текст пользователю (если можно ответить сразу, но чаще пусто)"
+}
 
-4) Show my budgets + remaining:
-{{ "type": "my_budgets" }}
-
-5) Clarification:
-{{
+2) clarify (нужен уточняющий вопрос):
+{
   "type": "clarify",
-  "question": "Short question in Russian asking only what is needed",
-  "expected": "one_of: amount|category|period|format|budget_period|budget_amount"
+  "question": "один короткий вопрос",
+  "expected": "amount|category|period|format|budget_period|budget_amount"
+}
+
+Правила:
+- Если запрос про "сколько потратил" => get_report_total
+- Если "на что тратил" / "разбивка" => get_report_breakdown
+- "мои бюджеты" / "остаток по бюджетам" => get_my_budgets
+- Для записи расхода — add_expense
+- Для бюджета — set_budget
+- Если пользователь просит "за неделю" — спроси уточнение (пока поддерживаем today/month)
+""".strip()
+
+RESPONDER_INSTRUCTIONS = f"""
+Тебе дадут:
+- исходный запрос пользователя
+- результаты действий из БД (data)
+- контекст (summary + история)
+
+Верни ТОЛЬКО JSON:
+{{
+  "type":"final",
+  "reply":"готовый ответ пользователю на русском",
+  "new_summary":"обновлённое краткое резюме диалога (до {MAX_SUMMARY_CHARS} символов)"
 }}
 
-Interpretation guidance:
-- "сколько я потратил сегодня" => report period=today format=total
-- "на что я тратил сегодня" => report period=today format=breakdown
-- "сколько за месяц" / "в этом месяце" => period=month
-- For expenses: accept phrases like "потратил 12000 на такси", "такси 12000", "минус 50000 кафе"
-- For budgets: accept "бюджет на день кофе 50000", "лимит на месяц еда 3000000"
-If the user asks something unrelated, return clarify with a question OR a safe response plan:
-{{"type":"clarify","question":"Уточните, что вы хотите: записать расход, поставить бюджет или показать статистику?","expected":"period"}}
+Требования к ответу:
+- коротко, без лишних деталей
+- если это запись расхода — покажи дневной и месячный остаток по категории (если бюджеты есть), иначе скажи что бюджеты не заданы
+- если это отчёт — выдай сумму или разбивку по категориям
+- если это бюджеты — покажи лимит/потрачено/осталось
 """.strip()
 
 
-async def openai_plan(user_text: str, state: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """
-    Takes free-form user text and (optionally) prior state, returns a JSON plan:
-    expense|budget|report|my_budgets|clarify
-    """
+async def openai_json(model: str, messages: List[Dict[str, Any]], timeout_s: int = 30) -> Dict[str, Any]:
     if not OPENAI_API_KEY:
-        return {"type": "clarify", "question": "Не задан OPENAI_API_KEY. Уточните, что вы хотите сделать?", "expected": "period"}
-
-    # If we have a pending clarification, provide it as context and ask the model to finalize.
-    state_text = ""
-    if state and state.get("pending") and state.get("question"):
-        state_text = (
-            "Previous clarification asked by the bot:\n"
-            f"Question: {state.get('question')}\n"
-            f"User answer now: {user_text}\n"
-            "Now produce the final plan. If still missing, ask another clarification.\n"
-        )
+        return {"type": "clarify", "question": "Не задан OPENAI_API_KEY. Добавьте ключ и повторите.", "expected": "period"}
 
     payload = {
-        "model": OPENAI_TEXT_MODEL,
-        "input": [
-            {"role": "system", "content": [{"type": "input_text", "text": PLANNER_SYSTEM}]},
-            {"role": "user", "content": [{"type": "input_text", "text": state_text + user_text}]},
-        ],
+        "model": model,
+        "input": messages,
         "text": {"format": {"type": "json_object"}},
     }
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
 
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with httpx.AsyncClient(timeout=timeout_s) as client:
         r = await client.post("https://api.openai.com/v1/responses", headers=headers, json=payload)
         if r.status_code >= 400:
-            logger.error("OpenAI planner error %s: %s", r.status_code, r.text[:300])
-            return {"type": "clarify", "question": "Не получилось обработать запрос. Повторите, пожалуйста, короче.", "expected": "period"}
+            logger.error("OpenAI error %s: %s", r.status_code, r.text[:300])
+            return {"type": "clarify", "question": "Не получилось обработать запрос. Повторите короче.", "expected": "period"}
         data = r.json()
 
     out = ""
@@ -396,11 +475,40 @@ async def openai_plan(user_text: str, state: Optional[Dict[str, Any]] = None) ->
     try:
         return json.loads(out) if out else {"type": "clarify", "question": "Уточните запрос.", "expected": "period"}
     except Exception:
-        return {"type": "clarify", "question": "Уточните запрос. Например: «сколько я потратил сегодня?»", "expected": "period"}
+        return {"type": "clarify", "question": "Уточните запрос.", "expected": "period"}
+
+
+def build_context_messages(summary: str, history: List[Dict[str, str]], user_text: str) -> List[Dict[str, Any]]:
+    # We pass summary + last turns as user/assistant messages to the model
+    content = []
+    content.append({"role": "system", "content": [{"type": "input_text", "text": SYSTEM_CORE}]})
+    if summary:
+        content.append({"role": "system", "content": [{"type": "input_text", "text": f"Краткое резюме контекста:\n{summary}"}]})
+    if history:
+        # replay last messages in natural form
+        for h in history:
+            role = "user" if h["role"] == "user" else "assistant"
+            content.append({"role": role, "content": [{"type": "input_text", "text": h["content"]}]})
+    content.append({"role": "user", "content": [{"type": "input_text", "text": user_text}]})
+    return content
+
+
+async def plan_from_openai(summary: str, history: List[Dict[str, str]], user_text: str) -> Dict[str, Any]:
+    msgs = build_context_messages(summary, history, user_text)
+    # Add planner instruction as last system message (strong)
+    msgs.insert(1, {"role": "system", "content": [{"type": "input_text", "text": PLANNER_INSTRUCTIONS}]})
+    return await openai_json(OPENAI_TEXT_MODEL, msgs, timeout_s=30)
+
+
+async def respond_from_openai(summary: str, history: List[Dict[str, str]], user_text: str, data: Dict[str, Any]) -> Dict[str, Any]:
+    msgs = build_context_messages(summary, history, user_text)
+    msgs.insert(1, {"role": "system", "content": [{"type": "input_text", "text": RESPONDER_INSTRUCTIONS}]})
+    msgs.append({"role": "system", "content": [{"type": "input_text", "text": f"Результаты из БД (data):\n{json.dumps(data, ensure_ascii=False)}"}]})
+    return await openai_json(OPENAI_TEXT_MODEL, msgs, timeout_s=30)
 
 
 # =========================
-# OpenAI: Receipt photo (optional)
+# Receipt photo (optional)
 # =========================
 
 RECEIPT_PROMPT = f"""
@@ -410,7 +518,7 @@ Return JSON only.
 Format:
 {{"type":"expense","amount":12345,"currency":"{DEFAULT_CURRENCY}","category":"продукты","note":"STORE"}}
 
-If you cannot confidently detect the total amount:
+If you cannot confidently detect total:
 {{"type":"unknown"}}
 """.strip()
 
@@ -456,59 +564,19 @@ async def parse_receipt(image_bytes: bytes) -> Dict[str, Any]:
 
 
 # =========================
-# Formatting helpers
+# DB-backed executors for planned actions
 # =========================
 
-def fmt_breakdown(title: str, rows: List[Dict[str, Any]]) -> str:
-    if not rows:
-        return f"{title}\nПока нет записей."
-    lines = [title]
-    total = 0.0
-    for r in rows:
-        spent = float(r["spent"])
-        total += spent
-        lines.append(f"• {r['category']}: {spent:.0f} {r['currency']}")
-    lines.append(f"\nИтого: {total:.0f} {DEFAULT_CURRENCY}")
-    return "\n".join(lines)
+def _today_start_utc() -> datetime:
+    return datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
 
+def _month_start_utc() -> datetime:
+    today = date.today()
+    return datetime(today.year, today.month, 1)
 
-def fmt_my_budgets(chat_id: int, user_id: int) -> str:
-    rows = list_budgets(chat_id, user_id)
-    if not rows:
-        return (
-            "Бюджеты не заданы.\n"
-            "Пример:\n"
-            "• «бюджет на день кофе 50000»\n"
-            "• «бюджет на месяц еда 3000000»"
-        )
-
-    # calculate remaining for each budget
-    today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
-    month_start = datetime(date.today().year, date.today().month, 1)
-
-    lines = ["Ваши бюджеты и остатки:"]
-    for r in rows:
-        cat = r["category"]
-        period = r["period"]
-        cur = r["currency"]
-        limit_amt = float(r["limit_amount"])
-
-        if period == "daily":
-            spent = spent_since(chat_id, user_id, today_start, category=cat, currency=cur)
-            label = "день"
-        else:
-            spent = spent_since(chat_id, user_id, month_start, category=cat, currency=cur)
-            label = "месяц"
-
-        left = limit_amt - spent
-        lines.append(f"• {cat} ({label}): лимит {limit_amt:.0f} {cur}, потрачено {spent:.0f} {cur}, осталось {left:.0f} {cur}")
-
-    return "\n".join(lines)
-
-
-def fmt_after_expense(chat_id: int, user_id: int, category: str, currency: str, amount: float) -> str:
-    today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
-    month_start = datetime(date.today().year, date.today().month, 1)
+def get_budget_remaining(chat_id: int, user_id: int, category: str, currency: str) -> Dict[str, Any]:
+    today_start = _today_start_utc()
+    month_start = _month_start_utc()
 
     d_limit = get_budget(chat_id, user_id, category, "daily", currency)
     m_limit = get_budget(chat_id, user_id, category, "monthly", currency)
@@ -516,19 +584,120 @@ def fmt_after_expense(chat_id: int, user_id: int, category: str, currency: str, 
     d_spent = spent_since(chat_id, user_id, today_start, category=category, currency=currency)
     m_spent = spent_since(chat_id, user_id, month_start, category=category, currency=currency)
 
-    lines = [f"✅ Записано: {category} — {amount:.0f} {currency}"]
+    return {
+        "daily": {
+            "limit": d_limit,
+            "spent": d_spent,
+            "left": (d_limit - d_spent) if d_limit is not None else None
+        },
+        "monthly": {
+            "limit": m_limit,
+            "spent": m_spent,
+            "left": (m_limit - m_spent) if m_limit is not None else None
+        }
+    }
 
-    if d_limit is not None:
-        lines.append(f"День: потрачено {d_spent:.0f} {currency}, лимит {d_limit:.0f}, осталось {d_limit - d_spent:.0f}")
-    else:
-        lines.append("День: бюджет не задан")
 
-    if m_limit is not None:
-        lines.append(f"Месяц: потрачено {m_spent:.0f} {currency}, лимит {m_limit:.0f}, осталось {m_limit - m_spent:.0f}")
-    else:
-        lines.append("Месяц: бюджет не задан")
+def execute_actions(chat_id: int, user_id: int, actions: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Executes allowed actions and returns structured data for the responder.
+    """
+    data: Dict[str, Any] = {"results": []}
 
-    return "\n".join(lines)
+    for a in actions:
+        action = str(a.get("action") or "").strip()
+
+        if action == "add_expense":
+            amount = float(a.get("amount"))
+            currency = str(a.get("currency") or DEFAULT_CURRENCY).upper()
+            category = str(a.get("category") or "другое").lower().strip()
+            note = str(a.get("note") or "").strip()
+
+            add_expense(chat_id, user_id, amount, currency, category, note)
+            rem = get_budget_remaining(chat_id, user_id, category, currency)
+
+            data["results"].append({
+                "action": "add_expense",
+                "amount": amount,
+                "currency": currency,
+                "category": category,
+                "note": note,
+                "remaining": rem
+            })
+
+        elif action == "set_budget":
+            period = str(a.get("period") or "").lower().strip()
+            category = str(a.get("category") or "другое").lower().strip()
+            limit_amount = float(a.get("limit_amount"))
+            currency = str(a.get("currency") or DEFAULT_CURRENCY).upper()
+
+            set_budget(chat_id, user_id, category, period, limit_amount, currency)
+            rem = get_budget_remaining(chat_id, user_id, category, currency)
+
+            data["results"].append({
+                "action": "set_budget",
+                "period": period,
+                "category": category,
+                "limit_amount": limit_amount,
+                "currency": currency,
+                "remaining": rem
+            })
+
+        elif action == "get_report_total":
+            period = str(a.get("period") or "").lower().strip()
+            if period == "today":
+                since = _today_start_utc()
+            else:
+                since = _month_start_utc()
+            total = spent_since(chat_id, user_id, since)
+            data["results"].append({
+                "action": "get_report_total",
+                "period": period,
+                "total": total,
+                "currency": DEFAULT_CURRENCY
+            })
+
+        elif action == "get_report_breakdown":
+            period = str(a.get("period") or "").lower().strip()
+            if period == "today":
+                since = _today_start_utc()
+            else:
+                since = _month_start_utc()
+            rows = breakdown_since(chat_id, user_id, since)
+            data["results"].append({
+                "action": "get_report_breakdown",
+                "period": period,
+                "rows": rows
+            })
+
+        elif action == "get_my_budgets":
+            budgets = list_budgets(chat_id, user_id)
+            # add remaining computed per budget line
+            enriched = []
+            for b in budgets:
+                cat = b["category"]
+                per = b["period"]
+                cur = b["currency"]
+                lim = float(b["limit_amount"])
+                since = _today_start_utc() if per == "daily" else _month_start_utc()
+                sp = spent_since(chat_id, user_id, since, category=cat, currency=cur)
+                enriched.append({
+                    "category": cat,
+                    "period": per,
+                    "currency": cur,
+                    "limit": lim,
+                    "spent": sp,
+                    "left": lim - sp
+                })
+            data["results"].append({
+                "action": "get_my_budgets",
+                "budgets": enriched
+            })
+
+        else:
+            data["results"].append({"action": action, "error": "unknown_action"})
+
+    return data
 
 
 # =========================
@@ -541,15 +710,15 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         BOT_USERNAME_CACHE = (context.bot.username or "").strip()
 
     await update.effective_message.reply_text(
-        "Я работаю в группе и понимаю свободный текст.\n"
-        "Чтобы экономить токены, я отвечаю, когда вы меня упоминаете.\n\n"
-        "Примеры:\n"
+        "Я веду диалоговый контекст и понимаю свободный текст.\n"
+        "Чтобы экономить токены, я отвечаю по упоминанию или ответом на моё сообщение.\n\n"
+        f"Примеры:\n"
         f"• @{BOT_USERNAME_CACHE} сколько я потратил сегодня?\n"
-        f"• @{BOT_USERNAME_CACHE} расскажи на что я тратил сегодня\n"
-        f"• @{BOT_USERNAME_CACHE} бюджет на день кофе 50000\n"
+        f"• @{BOT_USERNAME_CACHE} на что я тратил сегодня?\n"
         f"• @{BOT_USERNAME_CACHE} потратил 12000 на такси\n"
-        f"• @{BOT_USERNAME_CACHE} мои бюджеты\n\n"
-        "Если запрос неоднозначный — я задам уточняющий вопрос."
+        f"• @{BOT_USERNAME_CACHE} бюджет на день кофе 50000\n"
+        f"• @{BOT_USERNAME_CACHE} мои бюджеты\n"
+        "\nЕсли не хватает данных — задам один уточняющий вопрос."
     )
 
 
@@ -571,12 +740,14 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
 
-    # Check if user is replying to a pending clarification
+    # Allow processing if mentioned/replied-to-bot; OR if user is replying to a pending clarification and reply-to-bot.
     pending = get_user_state(chat_id, user_id)
 
-    # Mention-only processing (unless user replies to bot)
-    if pending and pending.get("pending") and msg.reply_to_message and msg.reply_to_message.from_user and msg.reply_to_message.from_user.is_bot:
-        pass
+    if pending and pending.get("pending"):
+        # only accept clarification answers as a reply to the bot message (prevents unintended triggers)
+        if not (msg.reply_to_message and msg.reply_to_message.from_user and msg.reply_to_message.from_user.is_bot):
+            if not should_process(update, bot_username):
+                return
     else:
         if not should_process(update, bot_username):
             return
@@ -585,107 +756,52 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not raw_text:
         return
 
-    # If it was mentioned, remove mention for cleaner planning
-    clean_text = _strip_bot_mention(raw_text, bot_username).strip()
+    # If mentioned, remove mention for cleaner model input
+    user_text = _strip_bot_mention(raw_text, bot_username).strip()
 
-    plan = await openai_plan(clean_text, state=pending)
+    # Load memory + last messages
+    summary = get_memory_summary(chat_id, user_id)
+    history = get_recent_history(chat_id, user_id, HISTORY_LIMIT)
+
+    # If we were waiting for clarification, prepend that context explicitly (state is already stored)
+    if pending and pending.get("pending") and pending.get("question"):
+        user_text = f"Я ранее спросил уточнение: {pending.get('question')}\nОтвет пользователя: {user_text}"
+
+    # Store user message to history first (so the model can see it next turn too)
+    add_convo_message(chat_id, user_id, "user", user_text)
+
+    plan = await plan_from_openai(summary, history, user_text)
 
     ptype = str(plan.get("type") or "").lower().strip()
 
-    # If we were in clarification mode and got a non-clarify plan, clear state
-    if pending and pending.get("pending") and ptype != "clarify":
-        clear_user_state(chat_id, user_id)
-
     if ptype == "clarify":
-        q = str(plan.get("question") or "").strip()
-        if not q:
-            q = "Уточните, пожалуйста, что именно вы хотите узнать или записать?"
-        # save pending clarification
+        q = str(plan.get("question") or "").strip() or "Уточните, пожалуйста, что именно вы хотите?"
         set_user_state(chat_id, user_id, {"pending": True, "question": q})
+        add_convo_message(chat_id, user_id, "assistant", q)
         await msg.reply_text(q)
         return
 
-    if ptype == "my_budgets":
-        await msg.reply_text(fmt_my_budgets(chat_id, user_id))
-        return
+    # Plan execution
+    actions = plan.get("actions") or []
+    if not isinstance(actions, list):
+        actions = []
 
-    if ptype == "report":
-        period = str(plan.get("period") or "").lower().strip()
-        fmt = str(plan.get("format") or "").lower().strip()  # total|breakdown
+    # If any pending state existed and we got a plan, clear it
+    if pending and pending.get("pending"):
+        clear_user_state(chat_id, user_id)
 
-        if period not in ("today", "month"):
-            set_user_state(chat_id, user_id, {"pending": True, "question": "За какой период: сегодня или месяц?"})
-            await msg.reply_text("За какой период: сегодня или месяц?")
-            return
+    data = execute_actions(chat_id, user_id, actions)
 
-        if fmt not in ("total", "breakdown"):
-            set_user_state(chat_id, user_id, {"pending": True, "question": "Нужна сумма или разбивка по категориям?"})
-            await msg.reply_text("Нужна сумма или разбивка по категориям?")
-            return
+    # Generate final response with context + DB data
+    final = await respond_from_openai(summary, history, user_text, data)
+    reply = str(final.get("reply") or "").strip() or "Готово."
+    new_summary = str(final.get("new_summary") or summary).strip()
 
-        if period == "today":
-            since = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
-            if fmt == "total":
-                total = spent_since(chat_id, user_id, since)
-                await msg.reply_text(f"Сегодня вы потратили: {total:.0f} {DEFAULT_CURRENCY}")
-            else:
-                rows = breakdown_since(chat_id, user_id, since)
-                await msg.reply_text(fmt_breakdown("Ваши расходы за сегодня:", rows))
-            return
+    # Persist assistant reply + new summary
+    add_convo_message(chat_id, user_id, "assistant", reply)
+    set_memory_summary(chat_id, user_id, new_summary)
 
-        if period == "month":
-            since = datetime(date.today().year, date.today().month, 1)
-            if fmt == "total":
-                total = spent_since(chat_id, user_id, since)
-                await msg.reply_text(f"В этом месяце вы потратили: {total:.0f} {DEFAULT_CURRENCY}")
-            else:
-                rows = breakdown_since(chat_id, user_id, since)
-                await msg.reply_text(fmt_breakdown("Ваши расходы за месяц:", rows))
-            return
-
-    if ptype == "budget":
-        try:
-            period = str(plan.get("period") or "").lower().strip()
-            category = str(plan.get("category") or "другое").lower().strip()
-            limit_amount = float(plan.get("limit_amount"))
-            currency = str(plan.get("currency") or DEFAULT_CURRENCY).upper().strip()
-        except Exception:
-            set_user_state(chat_id, user_id, {"pending": True, "question": "Уточните бюджет: период (день/месяц), категория и сумма."})
-            await msg.reply_text("Уточните бюджет: период (день/месяц), категория и сумма.")
-            return
-
-        if period not in ("daily", "monthly"):
-            set_user_state(chat_id, user_id, {"pending": True, "question": "Это бюджет на день или на месяц?"})
-            await msg.reply_text("Это бюджет на день или на месяц?")
-            return
-
-        set_budget(chat_id, user_id, category, period, limit_amount, currency)
-        label = "день" if period == "daily" else "месяц"
-        await msg.reply_text(f"Бюджет установлен ({label}): {category} — {limit_amount:.0f} {currency}")
-        return
-
-    if ptype == "expense":
-        try:
-            amount = float(plan.get("amount"))
-            currency = str(plan.get("currency") or DEFAULT_CURRENCY).upper().strip()
-            category = str(plan.get("category") or "другое").lower().strip()
-            note = str(plan.get("note") or "").strip()
-        except Exception:
-            set_user_state(chat_id, user_id, {"pending": True, "question": "Уточните расход: сумма и категория."})
-            await msg.reply_text("Уточните расход: сумма и категория.")
-            return
-
-        if amount <= 0:
-            await msg.reply_text("Сумма должна быть больше нуля.")
-            return
-
-        add_expense(chat_id, user_id, amount, currency, category, note)
-        await msg.reply_text(fmt_after_expense(chat_id, user_id, category, currency, amount))
-        return
-
-    # fallback
-    set_user_state(chat_id, user_id, {"pending": True, "question": "Уточните, вы хотите: записать расход, поставить бюджет или показать статистику?"})
-    await msg.reply_text("Уточните, вы хотите: записать расход, поставить бюджет или показать статистику?")
+    await msg.reply_text(reply)
 
 
 async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -703,7 +819,7 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_group(update) or not allowed_topic(update):
         return
 
-    # Process photo only when mentioned in caption (or reply to bot) to save tokens
+    # Process photo only when mentioned in caption or reply-to-bot (token saving)
     caption = (msg.caption or "").strip()
     mentioned = _extract_bot_mention(caption, msg.caption_entities, bot_username) if caption else False
     replied = bool(
@@ -740,7 +856,18 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     add_expense(chat_id, user_id, amount, currency, category, note)
-    await msg.reply_text("🧾 Чек записан\n" + fmt_after_expense(chat_id, user_id, category, currency, amount))
+    rem = get_budget_remaining(chat_id, user_id, category, currency)
+
+    # Update conversational memory quickly (no second model call here to save tokens)
+    add_convo_message(chat_id, user_id, "user", "[фото чека]")
+    reply = f"🧾 Чек записан: {category} — {amount:.0f} {currency}"
+    if rem["daily"]["limit"] is not None:
+        reply += f"\nДень осталось: {rem['daily']['left']:.0f} {currency}"
+    if rem["monthly"]["limit"] is not None:
+        reply += f"\nМесяц осталось: {rem['monthly']['left']:.0f} {currency}"
+    add_convo_message(chat_id, user_id, "assistant", reply)
+
+    await msg.reply_text(reply)
 
 
 # =========================
