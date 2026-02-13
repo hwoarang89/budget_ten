@@ -236,7 +236,16 @@ def main():
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(MessageHandler(filters.ALL, on_message))
-    app.run_polling()
+    public_url = os.getenv("PUBLIC_URL")
+    if not public_url:
+        raise RuntimeError("Missing env var: PUBLIC_URL")
+
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=int(os.getenv("PORT", "8080")),
+        url_path="telegram",
+        webhook_url=f"worker-production-e43d.up.railway.app/telegram",
+)
 
 if __name__ == "__main__":
     main()
