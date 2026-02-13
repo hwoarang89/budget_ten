@@ -1,8 +1,11 @@
 import os
 import re
+import json
+import base64
 import logging
 from datetime import datetime, date
 
+import httpx
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
@@ -22,6 +25,9 @@ DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 PUBLIC_URL = os.getenv("PUBLIC_URL", "").strip()
 PORT = int(os.getenv("PORT", "8080"))
 
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_VISION_MODEL = os.getenv("OPENAI_VISION_MODEL", "gpt-4.1-mini").strip()
+
 DEFAULT_CURRENCY = os.getenv("DEFAULT_CURRENCY", "UZS").strip() or "UZS"
 
 logging.basicConfig(level=logging.INFO)
@@ -39,13 +45,9 @@ def db():
 
 
 def init_db():
-    """
-    Creates tables if missing and safely migrates legacy schemas.
-    This function is safe to run on every start.
-    """
     with db() as conn, conn.cursor() as cur:
 
-        # -------- expenses table (legacy-safe) --------
+        # EXPENSES TABLE
         cur.execute("""
             CREATE TABLE IF NOT EXISTS expenses (
                 id SERIAL PRIMARY KEY,
@@ -58,11 +60,9 @@ def init_db():
             );
         """)
 
-        # Ensure key columns exist (legacy)
         cur.execute("ALTER TABLE expenses ADD COLUMN IF NOT EXISTS chat_id BIGINT;")
         cur.execute("ALTER TABLE expenses ADD COLUMN IF NOT EXISTS tg_user_id BIGINT;")
 
-        # Some old versions had spent_date (DATE NOT NULL). New version uses spent_at too.
         cur.execute("ALTER TABLE expenses ADD COLUMN IF NOT EXISTS spent_at TIMESTAMP;")
         cur.execute("UPDATE expenses SET spent_at = NOW() WHERE spent_at IS NULL;")
         cur.execute("ALTER TABLE expenses ALTER COLUMN spent_at SET NOT NULL;")
@@ -71,13 +71,12 @@ def init_db():
         cur.execute("UPDATE expenses SET spent_date = CURRENT_DATE WHERE spent_date IS NULL;")
         cur.execute("ALTER TABLE expenses ALTER COLUMN spent_date SET NOT NULL;")
 
-        # Index (safe now because spent_at guaranteed)
         cur.execute("""
             CREATE INDEX IF NOT EXISTS idx_expenses_chat_user_time
             ON expenses (chat_id, tg_user_id, spent_at);
         """)
 
-        # -------- budgets table (personal per chat) --------
+        # BUDGETS TABLE
         cur.execute("""
             CREATE TABLE IF NOT EXISTS budgets (
                 id SERIAL PRIMARY KEY,
@@ -93,7 +92,6 @@ def init_db():
         cur.execute("ALTER TABLE budgets ADD COLUMN IF NOT EXISTS chat_id BIGINT;")
         cur.execute("ALTER TABLE budgets ADD COLUMN IF NOT EXISTS tg_user_id BIGINT;")
 
-        # Unique constraint for personal budgets in a chat
         cur.execute("""
             CREATE UNIQUE INDEX IF NOT EXISTS budgets_unique_personal
             ON budgets (chat_id, tg_user_id, category, period, currency);
@@ -104,22 +102,19 @@ def init_db():
 
 # ================= BUSINESS =================
 
-def add_expense(chat_id: int, user_id: int, amount: float, currency: str, category: str):
-    """
-    Insert expense and satisfy both legacy columns: spent_at + spent_date.
-    """
+def add_expense(chat_id, user_id, amount, currency, category, note=""):
     with db() as conn, conn.cursor() as cur:
         cur.execute("""
             INSERT INTO expenses (
                 chat_id, tg_user_id, amount, currency, category,
-                spent_at, spent_date
+                note, spent_at, spent_date
             )
-            VALUES (%s, %s, %s, %s, %s, NOW(), CURRENT_DATE);
-        """, (chat_id, user_id, amount, currency, category))
+            VALUES (%s, %s, %s, %s, %s, %s, NOW(), CURRENT_DATE);
+        """, (chat_id, user_id, amount, currency, category, note))
         conn.commit()
 
 
-def set_budget(chat_id: int, user_id: int, category: str, limit_amount: float, currency: str):
+def set_budget(chat_id, user_id, category, limit_amount, currency):
     with db() as conn, conn.cursor() as cur:
         cur.execute("""
             INSERT INTO budgets (chat_id, tg_user_id, category, period, limit_amount, currency)
@@ -130,7 +125,7 @@ def set_budget(chat_id: int, user_id: int, category: str, limit_amount: float, c
         conn.commit()
 
 
-def month_spent(chat_id: int, user_id: int, category: str, currency: str) -> float:
+def month_spent(chat_id, user_id, category, currency):
     month_start = date.today().replace(day=1)
     with db() as conn, conn.cursor() as cur:
         cur.execute("""
@@ -144,7 +139,7 @@ def month_spent(chat_id: int, user_id: int, category: str, currency: str) -> flo
         return float(cur.fetchone()["s"])
 
 
-def get_budget(chat_id: int, user_id: int, category: str, currency: str):
+def get_budget(chat_id, user_id, category, currency):
     with db() as conn, conn.cursor() as cur:
         cur.execute("""
             SELECT limit_amount FROM budgets
@@ -156,24 +151,15 @@ def get_budget(chat_id: int, user_id: int, category: str, currency: str):
         return float(row["limit_amount"]) if row else None
 
 
-# ================= PARSER =================
+# ================= TEXT PARSER =================
 
-def simple_parse(text: str):
-    """
-    Very simple parser:
-    - finds the first integer number in text
-    - category = first word of remaining text
-    """
-    t = (text or "").strip()
-    if not t:
-        return None
-
-    m = re.search(r"(\d[\d\s]*)", t)
+def simple_parse(text):
+    m = re.search(r"(\d[\d\s]*)", text)
     if not m:
         return None
 
     amount = float(m.group(1).replace(" ", ""))
-    rest = (t[:m.start()] + " " + t[m.end():]).strip()
+    rest = (text[:m.start()] + " " + text[m.end():]).strip()
     words = rest.split()
     category = words[0].lower() if words else "other"
 
@@ -184,44 +170,96 @@ def simple_parse(text: str):
     }
 
 
+# ================= PHOTO RECEIPT OCR =================
+
+RECEIPT_PROMPT = f"""
+Extract expense data from this receipt image.
+Return JSON only.
+
+Format:
+{{"type":"expense","amount":12345,"currency":"UZS","category":"продукты","note":"STORE NAME"}}
+
+If amount cannot be confidently detected:
+{{"type":"unknown"}}
+"""
+
+
+async def parse_receipt(image_bytes: bytes):
+    if not OPENAI_API_KEY:
+        return {"type": "unknown"}
+
+    b64 = base64.b64encode(image_bytes).decode("utf-8")
+
+    payload = {
+        "model": OPENAI_VISION_MODEL,
+        "input": [
+            {"role": "system", "content": [{"type": "input_text", "text": RECEIPT_PROMPT}]},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "Extract total amount from this receipt."},
+                    {"type": "input_image", "image_url": f"data:image/jpeg;base64,{b64}"}
+                ]
+            }
+        ],
+        "text": {"format": {"type": "json_object"}}
+    }
+
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    async with httpx.AsyncClient(timeout=45) as client:
+        r = await client.post("https://api.openai.com/v1/responses", headers=headers, json=payload)
+        if r.status_code >= 400:
+            logger.error("OpenAI Vision error: %s", r.text[:300])
+            return {"type": "unknown"}
+        data = r.json()
+
+    output_text = ""
+    for item in data.get("output", []):
+        for c in item.get("content", []):
+            if c.get("type") == "output_text":
+                output_text += c.get("text", "")
+
+    try:
+        return json.loads(output_text)
+    except Exception:
+        return {"type": "unknown"}
+
+
 # ================= HANDLERS =================
 
 async def budget_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    parts = (update.message.text or "").split()
+    if len(parts) < 3:
+        await update.message.reply_text("Формат: /budget категория сумма")
+        return
+
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
 
-    parts = (update.message.text or "").split()
-    if len(parts) < 3:
-        await update.message.reply_text("Формат: /budget категория сумма\nПример: /budget еда 3000000")
-        return
-
     category = parts[1].lower()
-    try:
-        limit_amount = float(parts[2].replace(" ", ""))
-    except Exception:
-        await update.message.reply_text("Не смогла распознать сумму. Пример: /budget еда 3000000")
-        return
+    limit_amount = float(parts[2])
 
     set_budget(chat_id, user_id, category, limit_amount, DEFAULT_CURRENCY)
+
     await update.message.reply_text(
         f"Бюджет установлен: {category} — {limit_amount:.0f} {DEFAULT_CURRENCY}"
     )
 
 
-async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message:
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or update.message.text.startswith("/"):
         return
 
-    text = (update.message.text or "").strip()
-    if not text or text.startswith("/"):
+    parsed = simple_parse(update.message.text)
+    if not parsed:
         return
 
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
-
-    parsed = simple_parse(text)
-    if not parsed:
-        return  # ignore unknown messages
 
     amount = parsed["amount"]
     category = parsed["category"]
@@ -232,25 +270,51 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     spent = month_spent(chat_id, user_id, category, currency)
     limit_amt = get_budget(chat_id, user_id, category, currency)
 
-    if limit_amt is not None:
+    if limit_amt:
         left = limit_amt - spent
         await update.message.reply_text(
-            f"✅ Записано: {category} — {amount:.0f} {currency}\n"
-            f"Осталось по бюджету в этом месяце: {left:.0f} {currency} (лимит {limit_amt:.0f})"
+            f"Записано: {category} — {amount:.0f} {currency}\n"
+            f"Осталось: {left:.0f} (лимит {limit_amt:.0f})"
         )
     else:
         await update.message.reply_text(
-            f"✅ Записано: {category} — {amount:.0f} {currency}\n"
-            f"Бюджет не задан. Установите: /budget {category} 3000000"
+            f"Записано: {category} — {amount:.0f} {currency}\n"
+            f"Бюджет не задан."
         )
 
 
-# ================= WEBHOOK =================
+async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message.photo:
+        return
 
-def normalize_url(u: str) -> str:
-    u = (u or "").strip().rstrip("/")
-    if not u:
-        return ""
+    photo = update.message.photo[-1]
+    file = await photo.get_file()
+    image_bytes = await file.download_as_bytearray()
+
+    parsed = await parse_receipt(bytes(image_bytes))
+    if parsed.get("type") != "expense":
+        await update.message.reply_text("Не смогла распознать чек.")
+        return
+
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+
+    amount = float(parsed.get("amount"))
+    category = parsed.get("category", "другое")
+    currency = parsed.get("currency", DEFAULT_CURRENCY)
+    note = parsed.get("note", "")
+
+    add_expense(chat_id, user_id, amount, currency, category, note)
+
+    await update.message.reply_text(
+        f"Чек записан: {amount:.0f} {currency}\nКатегория: {category}"
+    )
+
+
+# ================= MAIN =================
+
+def normalize_url(u):
+    u = u.strip().rstrip("/")
     if not u.startswith("https://"):
         u = "https://" + u
     return u
@@ -263,14 +327,13 @@ def main():
     init_db()
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+
     app.add_handler(CommandHandler("budget", budget_cmd))
-    app.add_handler(MessageHandler(filters.ALL, on_message))
+    app.add_handler(MessageHandler(filters.PHOTO, on_photo))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
     public_url = normalize_url(PUBLIC_URL)
-    if not public_url:
-        raise RuntimeError("Missing PUBLIC_URL (example: https://xxxx.up.railway.app)")
 
-    # PTB webhooks mode
     app.run_webhook(
         listen="0.0.0.0",
         port=PORT,
