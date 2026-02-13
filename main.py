@@ -66,27 +66,35 @@ def init_db():
         conn.commit()
 
 async def openai_parse_text(user_text: str) -> dict:
-    # Responses API: text -> structured JSON (you can strengthen with json_schema if needed)
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
     payload = {
         "model": "gpt-5.2-chat-latest",
         "input": [
-            {"role": "system", "content": [{"type": "text", "text": SYSTEM_PROMPT.replace("DEFAULT_CURRENCY", DEFAULT_CURRENCY)}]},
-            {"role": "user", "content": [{"type": "text", "text": user_text}]}
+            {
+                "role": "system",
+                "content": [{"type": "input_text", "text": SYSTEM_PROMPT}]
+            },
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": user_text}]
+            }
         ],
         "text": {"format": {"type": "json_object"}}
     }
+
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.post("https://api.openai.com/v1/responses", headers=headers, json=payload)
-        r.raise_for_status()
+        if r.status_code >= 400:
+            raise RuntimeError(f"OpenAI error {r.status_code}: {r.text}")
         data = r.json()
-        # Most SDKs expose parsed output; here we safely extract text output:
-        out_text = ""
-        for item in data.get("output", []):
-            for c in item.get("content", []):
-                if c.get("type") == "output_text":
-                    out_text += c.get("text", "")
-        return json.loads(out_text)
+
+    out_text = ""
+    for item in data.get("output", []):
+        for c in item.get("content", []):
+            if c.get("type") == "output_text":
+                out_text += c.get("text", "")
+
+    return json.loads(out_text)
 
 async def openai_extract_from_image(image_bytes: bytes, hint: str = "") -> dict:
     # Vision: ask model to extract amount/currency/merchant-like note.
