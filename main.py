@@ -1,14 +1,12 @@
 import os
 import re
-import json
 import logging
 from datetime import datetime, date
 
-import httpx
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
-from telegram import Update, Bot
+from telegram import Update
 from telegram.ext import (
     Application,
     MessageHandler,
@@ -20,13 +18,11 @@ from telegram.ext import (
 # ================= CONFIG =================
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
-
 PUBLIC_URL = os.getenv("PUBLIC_URL", "").strip()
 PORT = int(os.getenv("PORT", "8080"))
 
-DEFAULT_CURRENCY = "UZS"
+DEFAULT_CURRENCY = os.getenv("DEFAULT_CURRENCY", "UZS").strip() or "UZS"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("budget-bot")
@@ -43,9 +39,13 @@ def db():
 
 
 def init_db():
+    """
+    Creates tables if missing and safely migrates legacy schemas.
+    This function is safe to run on every start.
+    """
     with db() as conn, conn.cursor() as cur:
 
-        # EXPENSES
+        # -------- expenses table (legacy-safe) --------
         cur.execute("""
             CREATE TABLE IF NOT EXISTS expenses (
                 id SERIAL PRIMARY KEY,
@@ -58,20 +58,26 @@ def init_db():
             );
         """)
 
-        # Safe migration for legacy
+        # Ensure key columns exist (legacy)
         cur.execute("ALTER TABLE expenses ADD COLUMN IF NOT EXISTS chat_id BIGINT;")
         cur.execute("ALTER TABLE expenses ADD COLUMN IF NOT EXISTS tg_user_id BIGINT;")
-        cur.execute("ALTER TABLE expenses ADD COLUMN IF NOT EXISTS spent_at TIMESTAMP;")
 
+        # Some old versions had spent_date (DATE NOT NULL). New version uses spent_at too.
+        cur.execute("ALTER TABLE expenses ADD COLUMN IF NOT EXISTS spent_at TIMESTAMP;")
         cur.execute("UPDATE expenses SET spent_at = NOW() WHERE spent_at IS NULL;")
         cur.execute("ALTER TABLE expenses ALTER COLUMN spent_at SET NOT NULL;")
 
+        cur.execute("ALTER TABLE expenses ADD COLUMN IF NOT EXISTS spent_date DATE;")
+        cur.execute("UPDATE expenses SET spent_date = CURRENT_DATE WHERE spent_date IS NULL;")
+        cur.execute("ALTER TABLE expenses ALTER COLUMN spent_date SET NOT NULL;")
+
+        # Index (safe now because spent_at guaranteed)
         cur.execute("""
             CREATE INDEX IF NOT EXISTS idx_expenses_chat_user_time
             ON expenses (chat_id, tg_user_id, spent_at);
         """)
 
-        # BUDGETS
+        # -------- budgets table (personal per chat) --------
         cur.execute("""
             CREATE TABLE IF NOT EXISTS budgets (
                 id SERIAL PRIMARY KEY,
@@ -87,6 +93,7 @@ def init_db():
         cur.execute("ALTER TABLE budgets ADD COLUMN IF NOT EXISTS chat_id BIGINT;")
         cur.execute("ALTER TABLE budgets ADD COLUMN IF NOT EXISTS tg_user_id BIGINT;")
 
+        # Unique constraint for personal budgets in a chat
         cur.execute("""
             CREATE UNIQUE INDEX IF NOT EXISTS budgets_unique_personal
             ON budgets (chat_id, tg_user_id, category, period, currency);
@@ -97,16 +104,22 @@ def init_db():
 
 # ================= BUSINESS =================
 
-def add_expense(chat_id, user_id, amount, currency, category):
+def add_expense(chat_id: int, user_id: int, amount: float, currency: str, category: str):
+    """
+    Insert expense and satisfy both legacy columns: spent_at + spent_date.
+    """
     with db() as conn, conn.cursor() as cur:
         cur.execute("""
-            INSERT INTO expenses (chat_id, tg_user_id, amount, currency, category, spent_at)
-            VALUES (%s, %s, %s, %s, %s, NOW());
+            INSERT INTO expenses (
+                chat_id, tg_user_id, amount, currency, category,
+                spent_at, spent_date
+            )
+            VALUES (%s, %s, %s, %s, %s, NOW(), CURRENT_DATE);
         """, (chat_id, user_id, amount, currency, category))
         conn.commit()
 
 
-def set_budget(chat_id, user_id, category, limit_amount, currency):
+def set_budget(chat_id: int, user_id: int, category: str, limit_amount: float, currency: str):
     with db() as conn, conn.cursor() as cur:
         cur.execute("""
             INSERT INTO budgets (chat_id, tg_user_id, category, period, limit_amount, currency)
@@ -117,7 +130,7 @@ def set_budget(chat_id, user_id, category, limit_amount, currency):
         conn.commit()
 
 
-def month_spent(chat_id, user_id, category, currency):
+def month_spent(chat_id: int, user_id: int, category: str, currency: str) -> float:
     month_start = date.today().replace(day=1)
     with db() as conn, conn.cursor() as cur:
         cur.execute("""
@@ -131,7 +144,7 @@ def month_spent(chat_id, user_id, category, currency):
         return float(cur.fetchone()["s"])
 
 
-def get_budget(chat_id, user_id, category, currency):
+def get_budget(chat_id: int, user_id: int, category: str, currency: str):
     with db() as conn, conn.cursor() as cur:
         cur.execute("""
             SELECT limit_amount FROM budgets
@@ -145,13 +158,23 @@ def get_budget(chat_id, user_id, category, currency):
 
 # ================= PARSER =================
 
-def simple_parse(text):
-    m = re.search(r"(\d[\d\s]*)", text)
+def simple_parse(text: str):
+    """
+    Very simple parser:
+    - finds the first integer number in text
+    - category = first word of remaining text
+    """
+    t = (text or "").strip()
+    if not t:
+        return None
+
+    m = re.search(r"(\d[\d\s]*)", t)
     if not m:
         return None
 
     amount = float(m.group(1).replace(" ", ""))
-    words = text.replace(m.group(0), "").strip().split()
+    rest = (t[:m.start()] + " " + t[m.end():]).strip()
+    words = rest.split()
     category = words[0].lower() if words else "other"
 
     return {
@@ -167,31 +190,38 @@ async def budget_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
 
-    parts = update.message.text.split()
+    parts = (update.message.text or "").split()
     if len(parts) < 3:
-        await update.message.reply_text("Формат: /budget категория сумма")
+        await update.message.reply_text("Формат: /budget категория сумма\nПример: /budget еда 3000000")
         return
 
     category = parts[1].lower()
-    limit_amount = float(parts[2])
+    try:
+        limit_amount = float(parts[2].replace(" ", ""))
+    except Exception:
+        await update.message.reply_text("Не смогла распознать сумму. Пример: /budget еда 3000000")
+        return
 
     set_budget(chat_id, user_id, category, limit_amount, DEFAULT_CURRENCY)
-
     await update.message.reply_text(
         f"Бюджет установлен: {category} — {limit_amount:.0f} {DEFAULT_CURRENCY}"
     )
 
 
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or update.message.text.startswith("/"):
+    if not update.message:
+        return
+
+    text = (update.message.text or "").strip()
+    if not text or text.startswith("/"):
         return
 
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
 
-    parsed = simple_parse(update.message.text)
+    parsed = simple_parse(text)
     if not parsed:
-        return
+        return  # ignore unknown messages
 
     amount = parsed["amount"]
     category = parsed["category"]
@@ -202,22 +232,25 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     spent = month_spent(chat_id, user_id, category, currency)
     limit_amt = get_budget(chat_id, user_id, category, currency)
 
-    if limit_amt:
+    if limit_amt is not None:
         left = limit_amt - spent
         await update.message.reply_text(
             f"✅ Записано: {category} — {amount:.0f} {currency}\n"
-            f"Осталось по бюджету: {left:.0f} {currency} (лимит {limit_amt:.0f})"
+            f"Осталось по бюджету в этом месяце: {left:.0f} {currency} (лимит {limit_amt:.0f})"
         )
     else:
         await update.message.reply_text(
-            f"✅ Записано: {category} — {amount:.0f} {currency}"
+            f"✅ Записано: {category} — {amount:.0f} {currency}\n"
+            f"Бюджет не задан. Установите: /budget {category} 3000000"
         )
 
 
-# ================= MAIN =================
+# ================= WEBHOOK =================
 
-def normalize_url(u):
-    u = u.strip().rstrip("/")
+def normalize_url(u: str) -> str:
+    u = (u or "").strip().rstrip("/")
+    if not u:
+        return ""
     if not u.startswith("https://"):
         u = "https://" + u
     return u
@@ -234,11 +267,10 @@ def main():
     app.add_handler(MessageHandler(filters.ALL, on_message))
 
     public_url = normalize_url(PUBLIC_URL)
+    if not public_url:
+        raise RuntimeError("Missing PUBLIC_URL (example: https://xxxx.up.railway.app)")
 
-    bot = Bot(token=TELEGRAM_BOT_TOKEN)
-    bot.delete_webhook(drop_pending_updates=True)
-    bot.set_webhook(url=f"{public_url}/telegram")
-
+    # PTB webhooks mode
     app.run_webhook(
         listen="0.0.0.0",
         port=PORT,
